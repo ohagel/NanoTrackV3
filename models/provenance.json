@@ -1,0 +1,17 @@
+{
+  "upstream_commit": "248663fde6bf7c40190cf10ee396d5662919ecd3",
+  "models": {
+    "nanotrack_backbone_sim.onnx": {
+      "source": "https://raw.githubusercontent.com/HonglinChu/SiamTrackers/248663fde6bf7c40190cf10ee396d5662919ecd3/NanoTrack/models/nanotrackv3/nanotrack_backbone.onnx",
+      "source_sha256": "50be1320abf9384fd3479ea829f95e244cf3f3838190c5ab60c750fb8c1ce828",
+      "prepared_sha256": "f9626be702f06f3fb9c792d9cfd27468f836a77dbf1a25132e66c9bab004d891",
+      "change": "dynamic spatial metadata + simplification"
+    },
+    "nanotrack_head_sim.onnx": {
+      "source": "https://raw.githubusercontent.com/HonglinChu/SiamTrackers/248663fde6bf7c40190cf10ee396d5662919ecd3/NanoTrack/models/nanotrackv3/nanotrack_head.onnx",
+      "source_sha256": "75357903be3f4817c965af16cb5a11fd32b1467f597a408405a98635ac63f61d",
+      "prepared_sha256": "41d0b00b3ebd5f5278f1f3381beee588b3ed9d6ef69ef1d23df3d2a518d9b6d8",
+      "change": "simplification"
+    }
+  }
+}

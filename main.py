@@ -1,11 +1,16 @@
 """Minimal webcam/video ROI tracking application."""
 import argparse
+from collections import deque
+from datetime import datetime, timezone
+import math
 from pathlib import Path
 from time import perf_counter
 
 import cv2
+import numpy as np
 
 from nanotrack import NanoTrackORT
+from recording import Recorder
 
 
 class LiveROI:
@@ -68,17 +73,30 @@ def main():
     parser.add_argument("--bbox", nargs=4, type=float, action="append", metavar=("X", "Y", "W", "H"), help="initial ROI; repeat for multiple targets")
     parser.add_argument("--headless", action="store_true", help="benchmark without windows; requires --bbox")
     parser.add_argument("--max-frames", type=int, default=0)
+    parser.add_argument("--trail-length", type=int, default=60, help="center positions per target; 0 disables trails")
+    parser.add_argument("--record", action="store_true", help="start recording immediately (also works headless)")
+    parser.add_argument("--record-dir", default="recordings", help="parent directory for recording sessions")
+    parser.add_argument("--record-fps", type=float, help="video playback FPS; defaults to source FPS or 30")
     args = parser.parse_args()
     if args.headless and args.bbox is None:
         parser.error("--headless requires --bbox")
+    if args.trail_length < 0:
+        parser.error("--trail-length must be >= 0")
+    if args.record_fps is not None and (not math.isfinite(args.record_fps) or args.record_fps <= 0):
+        parser.error("--record-fps must be finite and > 0")
     engine = NanoTrackORT(args.backbone, args.head, providers=args.providers,
                            threads=args.threads, debug=args.debug)
     source = int(args.source) if args.source.isdecimal() else args.source
     capture = cv2.VideoCapture(source)
     count, tracked, total_tracking, total_loop = 0, 0, 0.0, 0.0
-    window = "NanoTrack V3 | a add | Tab next | r select | t reseed | d remove | q quit"
+    window = "NanoTrack V3 | a add | Tab next | r select | t reseed | d remove | v record | q quit"
     selection = LiveROI()
     targets = {}
+    trails = {}
+    recorder = None
+    show_trails = True
+    run_start = perf_counter()
+    record_fps = args.record_fps or capture.get(cv2.CAP_PROP_FPS)
     selected = None
     next_id = 1
     replace_id = None
@@ -89,6 +107,7 @@ def main():
         target = engine.new_target()
         target.init(frame, roi)
         targets[next_id] = target
+        trails[next_id] = deque(maxlen=args.trail_length)
         selected = next_id
         next_id += 1
 
@@ -108,6 +127,8 @@ def main():
 
     try:
         ok, frame = capture.read()
+        captured_utc = datetime.now(timezone.utc).isoformat()
+        captured_elapsed = perf_counter() - run_start
         if not ok:
             raise RuntimeError(f"Cannot read source: {args.source}")
         if args.bbox:
@@ -118,6 +139,8 @@ def main():
         if not args.headless:
             cv2.namedWindow(window, cv2.WINDOW_AUTOSIZE)
             cv2.setMouseCallback(window, mouse)
+        if args.record:
+            recorder = Recorder(args.record_dir, frame.shape, record_fps, args.source)
         fps = 0.0
         while True:
             start = perf_counter()
@@ -125,17 +148,25 @@ def main():
             frame_tracking_ms = 0.0
             for identity, target in targets.items():
                 predictions[identity] = target.update(frame)
+                success, box, _ = predictions[identity]
+                if success:
+                    trails[identity].append((round(box[0]+box[2]/2), round(box[1]+box[3]/2)))
+                else:
+                    trails[identity].clear()
                 frame_tracking_ms += target.last_tracking_ms
             if targets:
                 total_tracking += frame_tracking_ms
                 tracked += 1
             count += 1
-            if not args.headless:
+            if not args.headless or recorder is not None:
                 display = frame.copy()  # Keep annotations out of r/t template crops.
                 status = f"{len(targets)} targets | selected {selected or '-'} | {fps:.1f} FPS | {frame_tracking_ms:.1f} ms"
                 for identity, (success, bbox, confidence) in predictions.items():
                     x, y, w, h = bbox
                     color = colors[(identity-1) % len(colors)] if success else (0, 0, 255)
+                    if show_trails and len(trails[identity]) > 1:
+                        cv2.polylines(display, [np.asarray(trails[identity], dtype=np.int32)],
+                                      False, color, 2, cv2.LINE_AA)
                     cv2.rectangle(display, (round(x), round(y)), (round(x+w), round(y+h)),
                                   color, 3 if identity == selected else 1)
                     cv2.putText(display, f"{'*' if identity == selected else ''}ID {identity}: {confidence:.3f}",
@@ -144,6 +175,16 @@ def main():
                 cv2.putText(display, status,
                             (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                 selection.draw(display, f"Replace ID {replace_id}" if replace_id is not None else "Add target")
+                if recorder is not None:
+                    cv2.putText(display, "REC", (max(0, display.shape[1]-65), 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, .7, (0, 0, 255), 2)
+                    source_ms = capture.get(cv2.CAP_PROP_POS_MSEC) if isinstance(source, str) else None
+                    if source_ms is not None and not math.isfinite(source_ms):
+                        source_ms = None
+                    recorder.write(display, source_frame=count-1, captured_utc=captured_utc,
+                                   elapsed_s=captured_elapsed, source_ms=source_ms,
+                                   predictions=predictions, tracking_ms=frame_tracking_ms)
+            if not args.headless:
                 cv2.imshow(window, display)
                 if args.debug and selected in targets:
                     target = targets[selected]
@@ -153,7 +194,15 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                if key == ord("a"):
+                if key == ord("v"):
+                    if recorder is None:
+                        recorder = Recorder(args.record_dir, frame.shape, record_fps, args.source)
+                    else:
+                        recorder.close()
+                        recorder = None
+                elif key == ord("l"):
+                    show_trails = not show_trails
+                elif key == ord("a"):
                     replace_id = None
                     selection.begin()
                 elif key == ord("r"):
@@ -171,6 +220,7 @@ def main():
                         target.reseed(frame, target.bbox)
                     elif key == ord("d") and selected in targets:
                         del targets[selected]
+                        del trails[selected]
                         selected = next(iter(targets), None)
                         if args.debug and selected is None:
                             cv2.destroyWindow("Template (BGR)")
@@ -181,6 +231,7 @@ def main():
                 if roi is not None:
                     if replace_id in targets:
                         targets[replace_id].init(frame, roi)
+                        trails[replace_id].clear()
                         selected = replace_id
                     else:
                         add(frame, roi)
@@ -190,6 +241,8 @@ def main():
             finished = bool(args.max_frames and count >= args.max_frames)
             if not finished:
                 ok, frame = capture.read()
+                captured_utc = datetime.now(timezone.utc).isoformat()
+                captured_elapsed = perf_counter() - run_start
             elapsed = perf_counter() - start
             total_loop += elapsed
             instantaneous = 1 / max(elapsed, 1e-9)
@@ -200,6 +253,8 @@ def main():
             print(f"{tracked} tracked frames | tracking {total_tracking/tracked:.2f} ms ({1000*tracked/total_tracking:.1f} FPS)"
                   f" | loop {count/max(total_loop, 1e-9):.1f} FPS | {len(targets)} targets remaining")
     finally:
+        if recorder is not None:
+            recorder.close()
         capture.release()
         cv2.destroyAllWindows()
 

@@ -33,6 +33,8 @@ selected box is thicker and its ID has a `*`. IDs are stable and never reused.
 | `r` | Draw a replacement ROI for the selected ID; adds a target if none exists |
 | `t` | Reseed only the selected target using its current predicted box |
 | `d` | Remove the selected target |
+| `l` | Show/hide target center trails |
+| `v` | Start/stop recording (red REC indicator while active) |
 | Escape / `c` | Cancel the current drag selection |
 
 `--debug` shows template/search crops and confidence/bbox for the selected target.
@@ -48,6 +50,36 @@ Repeat `--bbox` for multiple initial targets in repeatable/headless runs:
 ```powershell
 python main.py --source reference/girl_dance.mp4 --bbox 200 165 185 300 --bbox 440 158 197 310
 python -m unittest test_multiobject.py
+```
+
+## Trails and recording
+
+Trails retain the last 60 center positions per object. Use `--trail-length 120`
+for longer trails or `--trail-length 0` to disable storage. Replacing an ROI clears
+that target's trail; removing a target removes its trail. Reseeding keeps the trail.
+
+Press `v` to start/stop recording, or launch with `--record`. Each recording gets
+a new timestamped folder under `recordings/` (change with `--record-dir`). It contains:
+
+- `video.avi`: annotated MJPEG video with boxes, IDs, confidence and visible trails.
+- `tracking.jsonl`: one JSON record per saved frame, including target IDs, xywh
+  boxes, confidence, success, tracking time, UTC capture-receipt timestamp, elapsed
+  time since app startup, and video-source position in milliseconds when available.
+- `metadata.json`: source, video dimensions and playback FPS.
+
+Recording closes on stop, quit, video end or an application exception. A toggle
+starts saving with the next frame. Tracking data describes the predictions drawn
+on each saved frame, before any selection/reseed action made on that frame.
+Frame indices are zero-based. Frames without targets have an empty targets list.
+
+AVI uses constant playback FPS (source FPS, or 30 if unavailable); override with
+`--record-fps 30`. It writes each processed frame once without slowing the feed.
+If processing/camera timing varies, playback duration can differ from wall time;
+use the JSON timestamps for timing analysis. No audio is recorded.
+
+```powershell
+python main.py --source 0 --record --trail-length 90
+python -m unittest test_multiobject.py test_recording.py
 ```
 
 ## Models and the V3 export discrepancy

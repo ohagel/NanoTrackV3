@@ -1,6 +1,6 @@
 # NanoTrack V3 with ONNX Runtime
 
-A small arbitrary-ROI, axis-aligned bounding-box tracker. Runtime dependencies are
+A small multi-object, arbitrary-ROI, axis-aligned bounding-box tracker. Runtime dependencies are
 NumPy, OpenCV and ONNX Runtime. No `cv2.TrackerNano`, detection, segmentation or pose code.
 
 ## Run
@@ -19,19 +19,36 @@ If activation is restricted, use `.venv\Scripts\python.exe` directly. On macOS/L
 activate with `source .venv/bin/activate`.
 
 Drag a rectangle over the live feed and release the left mouse button to start
-tracking. The feed keeps updating while you select, both at startup and after `r`.
+tracking. Press `a` and drag again to add another object. The feed and existing
+trackers keep updating while you select, at startup and after `a` or `r`.
 The template comes from the displayed frame at release. Escape/C cancels selection;
-an existing target keeps tracking, or press `r` to begin selecting again.
+existing targets keep tracking. Click a box or press Tab to select a target. The
+selected box is thicker and its ID has a `*`. IDs are stable and never reused.
 
 | Key | Action |
 | --- | --- |
 | `q` | Quit |
-| `r` | Drag a new target on the live feed |
-| `t` | Replace the template and reset geometry using the current predicted box |
+| `a` | Add another object with a live drag selection |
+| Tab / click box | Select a target (Tab cycles through overlapping boxes) |
+| `r` | Draw a replacement ROI for the selected ID; adds a target if none exists |
+| `t` | Reseed only the selected target using its current predicted box |
+| `d` | Remove the selected target |
+| Escape / `c` | Cancel the current drag selection |
 
-`--debug` opens template/search crop windows and prints confidence/bbox. There is
+`--debug` shows template/search crops and confidence/bbox for the selected target.
+Target switching, `t`, and `d` are available outside drag selection. There is
 no automatic template update or frame-rate cap. `waitKey(1)` pumps the GUI.
-Tracking milliseconds exclude decode/display; smoothed FPS includes them.
+Tracking milliseconds sum inference/tracking across all objects and exclude
+decode/display; smoothed FPS includes them. Each box shows its own confidence.
+One camera capture and two ONNX sessions are shared by all targets. Processing
+is sequential and its cost grows approximately with the number of targets.
+
+Repeat `--bbox` for multiple initial targets in repeatable/headless runs:
+
+```powershell
+python main.py --source reference/girl_dance.mp4 --bbox 200 165 185 300 --bbox 440 158 197 310
+python -m unittest test_multiobject.py
+```
 
 ## Models and the V3 export discrepancy
 
@@ -112,12 +129,19 @@ tracker = NanoTrackORT(
 tracker.init(frame, (x, y, width, height))
 success, bbox, confidence = tracker.update(frame)
 tracker.reseed(frame, bbox)  # Same sessions; recomputes template, mean, geometry.
+
+other = tracker.new_target()  # Shares sessions; independent, uninitialized state.
+other.init(frame, another_bbox)
+# In each capture iteration, call update(frame) on both trackers.
 ```
 
 Sessions are constructed once. Constructor probes both crop sizes and head outputs
 to validate interfaces and warm up inference. Ordinary updates run one search
 backbone and one head call; init/reseed run one template backbone call.
-The tracker is stateful and intended for one target from one calling thread.
+Each tracker instance holds one target's state. The app uses `new_target()` to
+share sessions while keeping templates, geometry and debug images independent.
+All updates run in one calling thread. These independent trackers can drift onto
+each other during overlap; IDs label tracker instances, not guaranteed identities.
 
 `confidence` is the raw foreground softmax probability at the candidate selected
 *after* penalties/window ranking. It is not the windowed score or necessarily the

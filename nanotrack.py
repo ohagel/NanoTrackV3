@@ -3,6 +3,7 @@
 Algorithm/config source is pinned in models/provenance.json. No TrackerNano API.
 """
 from time import perf_counter
+from copy import copy
 
 import cv2
 import numpy as np
@@ -50,6 +51,20 @@ class NanoTrackORT:
         x, y = np.meshgrid(axis, axis)
         self.points = np.stack((x.ravel(), y.ravel()), axis=1).astype(np.float32)
         self.window = np.outer(np.hanning(self.SCORE_SIZE), np.hanning(self.SCORE_SIZE)).ravel()
+
+    def new_target(self):
+        """Create uninitialized target state sharing these validated ORT sessions.
+
+        Templates, geometry and debug crops remain independent. Use init() on the
+        returned tracker. Sessions and read-only grid/window arrays are shared.
+        """
+        target = copy(self)
+        target.template_features = None
+        target.template_image = target.search_image = None
+        target.confidence = target.last_tracking_ms = 0.0
+        for name in ("center_pos", "size", "channel_average"):
+            target.__dict__.pop(name, None)
+        return target
 
     def _validate_interfaces(self):
         bi, bo = self.backbone.get_inputs(), self.backbone.get_outputs()

@@ -22,7 +22,8 @@ class NanoTrackORT:
 
     def __init__(self, backbone_path="models/nanotrack_backbone_sim.onnx",
                  head_path="models/nanotrack_head_sim.onnx", *, providers=None,
-                 threads=1, confidence_threshold=0.0, debug=False):
+                 threads=1, confidence_threshold=0.0, debug=False,
+                 auto_update_template=False, template_fc_hz=0.0):
         if threads < 0 or not 0 <= confidence_threshold <= 1:
             raise ValueError("threads must be >= 0; confidence_threshold must be in [0, 1]")
         providers = ["CPUExecutionProvider"] if providers is None else list(providers)
@@ -35,6 +36,10 @@ class NanoTrackORT:
         self.backbone = ort.InferenceSession(str(backbone_path), options, providers=providers)
         self.head = ort.InferenceSession(str(head_path), options, providers=providers)
         self.debug = debug
+        self.auto_update_template = auto_update_template
+        self.template_fc_hz = template_fc_hz
+        self.template_pixels = None
+        self._last_update_time = self._last_template_time = None
         self.confidence_threshold = confidence_threshold
         self.template_image = self.search_image = None
         self.template_features = None
@@ -60,11 +65,24 @@ class NanoTrackORT:
         """
         target = copy(self)
         target.template_features = None
+        target.template_pixels = None
+        target._last_update_time = target._last_template_time = None
         target.template_image = target.search_image = None
         target.confidence = target.last_tracking_ms = 0.0
         for name in ("center_pos", "size", "channel_average"):
             target.__dict__.pop(name, None)
         return target
+
+    @property
+    def template_fc_hz(self):
+        return self._template_fc_hz
+
+    @template_fc_hz.setter
+    def template_fc_hz(self, value):
+        value = float(value)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError("template_fc_hz must be finite and >= 0 (0 bypasses filtering)")
+        self._template_fc_hz = value
 
     def _validate_interfaces(self):
         bi, bo = self.backbone.get_inputs(), self.backbone.get_outputs()
@@ -144,6 +162,8 @@ class NanoTrackORT:
         features = self._features(crop)
         self.center_pos, self.size, self.channel_average = center, size, average
         self.template_features = features
+        self.template_pixels = crop
+        self._last_update_time = self._last_template_time = perf_counter()
         self.template_image = image if self.debug else None
         self.search_image = None
         self.confidence = 0.0
@@ -152,13 +172,41 @@ class NanoTrackORT:
         """Reset target geometry and template; keep both inference sessions alive."""
         self.init(frame, bbox)
 
+    def refresh_template(self, frame, *, dt=None):
+        """Refresh pixels at current geometry, optionally low-pass filtering in time.
+
+        dt is seconds between samples; omitted means monotonic wall time.
+        Filtering is per BGR pixel on resized 127x127 crops, before the backbone.
+        """
+        self._validate_frame(frame)
+        if self.template_features is None:
+            raise RuntimeError("Call init() before refreshing the template")
+        now = perf_counter()
+        dt = now - self._last_template_time if dt is None else float(dt)
+        if not np.isfinite(dt) or dt < 0:
+            raise ValueError("dt must be finite and >= 0 seconds")
+        average = frame.mean(axis=(0, 1))
+        side = round(np.sqrt(np.prod(self.size + self.CONTEXT * self.size.sum())))
+        crop, image = self._crop(frame, self.center_pos, self.TEMPLATE_SIZE, side, average)
+        if self.template_fc_hz > 0:
+            alpha = float(-np.expm1(-2 * np.pi * self.template_fc_hz * dt))
+            crop = self.template_pixels + np.float32(alpha) * (crop - self.template_pixels)
+            if self.debug:
+                image = np.rint(crop[0].transpose(1, 2, 0)).clip(0, 255).astype(np.uint8)
+        features = self._features(crop)
+        self.template_pixels = crop
+        self._last_template_time = now
+        self.template_features = features
+        self.channel_average = average
+        self.template_image = image if self.debug else None
+
     @property
     def bbox(self):
         if self.template_features is None:
             raise RuntimeError("Call init() first")
         return tuple(float(v) for v in np.concatenate((self.center_pos - self.size / 2, self.size)))
 
-    def update(self, frame):
+    def update(self, frame, *, dt=None):
         """Return (success, xywh, raw foreground probability at chosen candidate).
 
         Upstream has no lost-target test. Default success means a finite prediction;
@@ -168,6 +216,10 @@ class NanoTrackORT:
         if self.template_features is None:
             raise RuntimeError("Call init() before update()")
         start = perf_counter()
+        dt = start - self._last_update_time if dt is None else float(dt)
+        if not np.isfinite(dt) or dt < 0:
+            raise ValueError("dt must be finite and >= 0 seconds")
+        self._last_update_time = start
         side = np.sqrt(np.prod(self.size + self.CONTEXT * self.size.sum()))
         scale = self.TEMPLATE_SIZE / side
         crop, image = self._crop(frame, self.center_pos, self.SEARCH_SIZE,
@@ -210,5 +262,9 @@ class NanoTrackORT:
         self.center_pos = np.clip(center, 0, boundary)
         self.size = np.maximum(10, np.minimum(size, boundary))
         self.confidence = float(scores[best])
+        if self.auto_update_template:
+            # Use this frame's predicted location for the NEXT frame's search.
+            # Deliberately no confidence gating, blending or update interval.
+            self.refresh_template(frame, dt=dt)
         self.last_tracking_ms = (perf_counter() - start) * 1000
         return self.confidence >= self.confidence_threshold, self.bbox, self.confidence

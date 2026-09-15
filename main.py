@@ -70,6 +70,8 @@ def main():
     parser.add_argument("--providers", nargs="+", default=["CPUExecutionProvider"])
     parser.add_argument("--threads", type=int, default=1, help="ORT threads; 0 = runtime default")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--auto-template", action="store_true", help="replace every target template after each prediction")
+    parser.add_argument("--template-fc", type=float, default=2.0, help="template temporal low-pass cutoff in Hz; 0 bypasses (default 2)")
     parser.add_argument("--bbox", nargs=4, type=float, action="append", metavar=("X", "Y", "W", "H"), help="initial ROI; repeat for multiple targets")
     parser.add_argument("--headless", action="store_true", help="benchmark without windows; requires --bbox")
     parser.add_argument("--max-frames", type=int, default=0)
@@ -82,6 +84,8 @@ def main():
         parser.error("--headless requires --bbox")
     if args.trail_length < 0:
         parser.error("--trail-length must be >= 0")
+    if not math.isfinite(args.template_fc) or args.template_fc < 0:
+        parser.error("--template-fc must be finite and >= 0")
     if args.record_fps is not None and (not math.isfinite(args.record_fps) or args.record_fps <= 0):
         parser.error("--record-fps must be finite and > 0")
     engine = NanoTrackORT(args.backbone, args.head, providers=args.providers,
@@ -89,14 +93,19 @@ def main():
     source = int(args.source) if args.source.isdecimal() else args.source
     capture = cv2.VideoCapture(source)
     count, tracked, total_tracking, total_loop = 0, 0, 0.0, 0.0
-    window = "NanoTrack V3 | a add | Tab next | r select | t reseed | d remove | v record | q quit"
+    window = "NanoTrack V3 | a add | Tab next | r select | t reseed | u auto-template | d remove | v record | q quit"
     selection = LiveROI()
     targets = {}
     trails = {}
     recorder = None
     show_trails = True
+    auto_template = args.auto_template
+    template_fc = args.template_fc
     run_start = perf_counter()
     record_fps = args.record_fps or capture.get(cv2.CAP_PROP_FPS)
+    source_fps = capture.get(cv2.CAP_PROP_FPS)
+    video_dt = 1 / source_fps if isinstance(source, str) and math.isfinite(source_fps) and source_fps > 0 else None
+    previous_capture_elapsed = None
     selected = None
     next_id = 1
     replace_id = None
@@ -145,9 +154,13 @@ def main():
         while True:
             start = perf_counter()
             predictions = {}
+            frame_dt = video_dt if video_dt is not None else (0.0 if previous_capture_elapsed is None else captured_elapsed - previous_capture_elapsed)
+            previous_capture_elapsed = captured_elapsed
             frame_tracking_ms = 0.0
             for identity, target in targets.items():
-                predictions[identity] = target.update(frame)
+                target.auto_update_template = auto_template
+                target.template_fc_hz = template_fc
+                predictions[identity] = target.update(frame, dt=frame_dt)
                 success, box, _ = predictions[identity]
                 if success:
                     trails[identity].append((round(box[0]+box[2]/2), round(box[1]+box[3]/2)))
@@ -174,6 +187,10 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, .55, color, 2)
                 cv2.putText(display, status,
                             (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                filter_label = f"{template_fc:g} Hz" if template_fc else "bypass"
+                cv2.putText(display, f"Auto-template: {'ON' if auto_template else 'OFF'} [u] | Fc: {filter_label} [ / ]",
+                            (12, display.shape[0]-12), cv2.FONT_HERSHEY_SIMPLEX, .6,
+                            (0, 165, 255) if auto_template else (220, 220, 220), 2)
                 selection.draw(display, f"Replace ID {replace_id}" if replace_id is not None else "Add target")
                 if recorder is not None:
                     cv2.putText(display, "REC", (max(0, display.shape[1]-65), 55),
@@ -183,7 +200,9 @@ def main():
                         source_ms = None
                     recorder.write(display, source_frame=count-1, captured_utc=captured_utc,
                                    elapsed_s=captured_elapsed, source_ms=source_ms,
-                                   predictions=predictions, tracking_ms=frame_tracking_ms)
+                                   predictions=predictions, tracking_ms=frame_tracking_ms,
+                                   auto_template=auto_template, template_fc_hz=template_fc,
+                                   template_dt_s=frame_dt)
             if not args.headless:
                 cv2.imshow(window, display)
                 if args.debug and selected in targets:
@@ -194,7 +213,13 @@ def main():
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
-                if key == ord("v"):
+                if key == ord("u"):
+                    auto_template = not auto_template
+                    print(f"Auto-template: {'ON' if auto_template else 'OFF'} (all targets)")
+                elif key in (ord("["), ord("]")):
+                    template_fc = max(0.0, round(template_fc + (-0.5 if key == ord("[") else 0.5), 3))
+                    print(f"Template Fc: {template_fc:g} Hz (0 = bypass)")
+                elif key == ord("v"):
                     if recorder is None:
                         recorder = Recorder(args.record_dir, frame.shape, record_fps, args.source)
                     else:

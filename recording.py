@@ -33,12 +33,15 @@ class Recorder:
             raise
         print(f"Recording: {self.folder.resolve()}")
 
-    def write(self, image, *, source_frame, captured_utc, elapsed_s, source_ms, predictions, tracking_ms):
+    def write(self, image, *, source_frame, captured_utc, elapsed_s, source_ms, predictions, tracking_ms,
+              auto_template=False, template_fc_hz=0.0, template_dt_s=None):
         if (image.shape[1], image.shape[0]) != self.size:
             raise RuntimeError("Frame size changed during recording; stop and start a new recording")
         record = {"recording_frame": self.frames, "source_frame": source_frame,
                   "captured_utc": captured_utc, "elapsed_s": elapsed_s,
                   "source_ms": source_ms, "tracking_ms": tracking_ms,
+                  "auto_template": bool(auto_template),
+                  "template_fc_hz": float(template_fc_hz), "template_dt_s": template_dt_s,
                   "targets": [{"id": identity, "success": bool(success),
                                "bbox": list(box), "confidence": float(confidence)}
                               for identity, (success, box, confidence) in predictions.items()]}

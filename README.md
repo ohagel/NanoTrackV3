@@ -32,6 +32,8 @@ selected box is thicker and its ID has a `*`. IDs are stable and never reused.
 | Tab / click box | Select a target (Tab cycles through overlapping boxes) |
 | `r` | Draw a replacement ROI for the selected ID; adds a target if none exists |
 | `t` | Reseed only the selected target using its current predicted box |
+| `u` | Toggle continuous template updates for all targets |
+| `[` / `]` | Decrease/increase template low-pass Fc by 0.5 Hz (0 bypasses) |
 | `d` | Remove the selected target |
 | `l` | Show/hide target center trails |
 | `v` | Start/stop recording (red REC indicator while active) |
@@ -39,7 +41,7 @@ selected box is thicker and its ID has a `*`. IDs are stable and never reused.
 
 `--debug` shows template/search crops and confidence/bbox for the selected target.
 Target switching, `t`, and `d` are available outside drag selection. There is
-no automatic template update or frame-rate cap. `waitKey(1)` pumps the GUI.
+no frame-rate cap. Automatic template updating is off by default. `waitKey(1)` pumps the GUI.
 Tracking milliseconds sum inference/tracking across all objects and exclude
 decode/display; smoothed FPS includes them. Each box shows its own confidence.
 One camera capture and two ONNX sessions are shared by all targets. Processing
@@ -51,6 +53,68 @@ Repeat `--bbox` for multiple initial targets in repeatable/headless runs:
 python main.py --source reference/girl_dance.mp4 --bbox 200 165 185 300 --bbox 440 158 197 310
 python -m unittest test_multiobject.py
 ```
+
+## Continuous template experiment
+
+Press `u` to toggle template updating for **all targets**, including subsequently
+added targets. The on-screen indicator shows its state. Start enabled with:
+
+```powershell
+python main.py --source 0 --auto-template --debug
+```
+
+After each prediction, this mode refreshes the target's template with a fresh
+127x127 context crop from the clean current frame at the predicted center/size.
+That template is used to search the next frame. There is no confidence gating
+or update interval; only invalid network outputs skip the update. The app applies
+the pixel filter described below unless Fc is set to 0.
+Turning it off keeps the most recent template, rather than restoring the original.
+Use `r` to select the target again if it drifts.
+
+Template refresh preserves the bounding box, confidence, search debug image and
+trail. It does not repeatedly call `init()`, which would introduce its half-pixel
+center offset. Sessions remain shared and unchanged. The extra template backbone
+inference and crop cost are included in tracking milliseconds/FPS. The debug
+template window shows the freshly updated template. Recordings log the mode in
+each frame's `auto_template` field. This intentionally naive mode may reinforce
+drift; it is provided to experiment with that behavior.
+
+API: construct with `auto_update_template=True`, or change that attribute at
+runtime. `refresh_template(frame)` performs one template-only refresh manually.
+
+### Pixel-wise template low-pass filter
+
+The app defaults to **Fc = 2 Hz**. Use `--template-fc 0` for the previous unfiltered
+replacement experiment, or e.g. `--auto-template --template-fc 1 --debug` for a
+slower update. `[` and `]` adjust Fc live for all targets. Lower positive Fc retains
+more history; higher Fc responds faster. **0 means bypass**, not a frozen template.
+Filtering only runs when the template is refreshed; `u` still controls automatic
+updates. Turning automatic updates off retains the latest filtered template.
+
+For each BGR pixel/channel on the resized 127x127 template crop:
+
+```text
+alpha = 1 - exp(-2*pi*Fc*dt)
+template = previous_template + alpha * (new_crop - previous_template)
+```
+
+This is an exponential discretization of a first-order temporal low-pass with
+time constant `1/(2*pi*Fc)`; Fc is the continuous-time cutoff parameter (the sampled
+filter's exact -3 dB point differs near the sampling limit). Filtering uses float32
+pixels **before backbone inference**, with no spatial blur or feature blending.
+Initialization, ROI replacement and manual `t` reseeding reset the pixel history.
+The debug template window shows the actual filtered pixels, rounded for display.
+Motion within the aligned crop can produce ghosting; no pixel registration is added.
+
+For video files `dt` is one source-FPS interval, independent of processing speed.
+For cameras, or files without valid FPS, it is elapsed capture-receipt time (the
+first camera sample uses zero). Source-FPS timing assumes constant-frame-rate video.
+Recordings include `template_fc_hz` and `template_dt_s` on every frame.
+
+The reusable API defaults to `template_fc_hz=0.0` for backward compatibility.
+Set `tracker.template_fc_hz = 2.0` and call `update(frame, dt=1/30)` for explicit
+sample timing; omitted `dt` uses monotonic time between calls. Each target keeps
+its own pixel history while sharing the ONNX sessions.
 
 ## Trails and recording
 
@@ -169,7 +233,8 @@ other.init(frame, another_bbox)
 
 Sessions are constructed once. Constructor probes both crop sizes and head outputs
 to validate interfaces and warm up inference. Ordinary updates run one search
-backbone and one head call; init/reseed run one template backbone call.
+backbone and one head call in the default mode; init/reseed run one template
+backbone call. Continuous mode adds one template backbone call after each prediction.
 Each tracker instance holds one target's state. The app uses `new_target()` to
 share sessions while keeping templates, geometry and debug images independent.
 All updates run in one calling thread. These independent trackers can drift onto
@@ -228,4 +293,5 @@ NanoTrack is a local single-template tracker. Large rotations, perspective chang
 occlusion or fast motion outside the search area can cause drift. Its saturated
 classification confidence is not a calibrated correctness/lost-target probability.
 Manual `t` can help appearance adaptation but can also reinforce a drifted box;
-`r` selects the intended target again. No automatic reseeding is enabled.
+`r` selects the intended target again. Continuous updating is opt-in via `u` or
+`--auto-template`.

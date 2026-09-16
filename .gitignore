@@ -2,3 +2,6 @@
 __pycache__/
 validation_output/
 recordings/
+evaluation_output/
+Videos/
+Video_Annotation-v2/

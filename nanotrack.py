@@ -4,10 +4,29 @@ Algorithm/config source is pinned in models/provenance.json. No TrackerNano API.
 """
 from time import perf_counter
 from copy import copy
+import weakref
 
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+
+class _GraphPool:
+    """Retain captured addresses and recycle slots after targets are discarded."""
+    def __init__(self):
+        self.slots, self.free = [], []
+
+    def acquire(self):
+        if self.free:
+            return self.free.pop()
+        options = ort.RunOptions()
+        options.add_run_config_entry('gpu_graph_id', str(len(self.slots)))
+        slot = dict(backbone={}, head=None, options=options)
+        self.slots.append(slot)
+        return slot
+
+    def release(self, slot):
+        self.free.append(slot)
 
 
 class NanoTrackORT:
@@ -23,18 +42,56 @@ class NanoTrackORT:
     def __init__(self, backbone_path="models/nanotrack_backbone_sim.onnx",
                  head_path="models/nanotrack_head_sim.onnx", *, providers=None,
                  threads=1, confidence_threshold=0.0, debug=False,
-                 auto_update_template=False, template_fc_hz=0.0):
+                 auto_update_template=False, template_fc_hz=0.0, cuda_graphs=False):
         if threads < 0 or not 0 <= confidence_threshold <= 1:
             raise ValueError("threads must be >= 0; confidence_threshold must be in [0, 1]")
         providers = ["CPUExecutionProvider"] if providers is None else list(providers)
-        unavailable = set(p if isinstance(p, str) else p[0] for p in providers) - set(ort.get_available_providers())
+        self.cuda_graphs = bool(cuda_graphs)
+        if self.cuda_graphs:
+            primary = providers[0] if providers else None
+            if (primary if isinstance(primary, str) else primary[0] if primary else None) != 'CUDAExecutionProvider':
+                raise ValueError('cuda_graphs requires CUDAExecutionProvider first')
+            provider_options = {} if isinstance(primary, str) else dict(primary[1])
+            provider_options['enable_cuda_graph'] = '1'
+            providers[0] = ('CUDAExecutionProvider', provider_options)
+        elif any(not isinstance(p, str) and str(p[1].get('enable_cuda_graph', '0')) == '1' for p in providers):
+            raise ValueError('Use cuda_graphs=True to enable graph-safe buffer management')
+        requested = set(p if isinstance(p, str) else p[0] for p in providers)
+        unavailable = requested - set(ort.get_available_providers())
         if unavailable or not providers:
-            raise ValueError(f"Unavailable providers: {unavailable}; available: {ort.get_available_providers()}")
+            hint = " Install requirements-gpu.txt after uninstalling the CPU-only onnxruntime package." if 'CUDAExecutionProvider' in unavailable else ''
+            raise ValueError(f"Unavailable providers: {unavailable}; available: {ort.get_available_providers()}.{hint}")
+        if 'CUDAExecutionProvider' in requested and hasattr(ort, 'preload_dlls'):
+            # Load CUDA/cuDNN DLLs shipped by the NVIDIA pip packages on Windows.
+            ort.preload_dlls()
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         self.backbone = ort.InferenceSession(str(backbone_path), options, providers=providers)
         self.head = ort.InferenceSession(str(head_path), options, providers=providers)
+        for name, session in (("Backbone", self.backbone), ("Head", self.head)):
+            active = session.get_providers()
+            print(f"{name} execution providers: {active}")
+            if 'CUDAExecutionProvider' in requested and 'CUDAExecutionProvider' not in active:
+                raise RuntimeError(f"{name}: CUDA failed to initialize; refusing silent CPU fallback. "
+                                   "Check the CUDA/cuDNN DLL error above and requirements-gpu.txt.")
+        self.feature_device, self.device_id = self._select_feature_device(self.backbone, self.head)
+        # CUDA convolution setup is expensive when a session alternates spatial
+        # sizes. Keep one persistent session per crop size, shared by all targets.
+        self.template_backbone = self.backbone
+        if self.feature_device == 'cuda':
+            self.template_backbone = ort.InferenceSession(str(backbone_path), options, providers=providers)
+            self._select_feature_device(self.template_backbone, self.backbone)
+            print(f"Template backbone execution providers: {self.template_backbone.get_providers()}")
+        self._backbone_buffers = {}
+        self._head_buffers = None
+        self._graph_pool = _GraphPool() if self.cuda_graphs else None
+        self._graph_slot = None
+        if self.cuda_graphs:
+            self._attach_graph_slot()
+            print('CUDA Graphs: enabled (reusable per-target capture slots)')
+        print(f"Feature transport: {self.feature_device}:{self.device_id} "
+              f"({'resident I/O bindings' if self.feature_device != 'cpu' else 'host NumPy'})")
         self.debug = debug
         self.auto_update_template = auto_update_template
         self.template_fc_hz = template_fc_hz
@@ -64,6 +121,11 @@ class NanoTrackORT:
         returned tracker. Sessions and read-only grid/window arrays are shared.
         """
         target = copy(self)
+        # Sessions are shared; writable device buffers/bindings belong to each target.
+        target._backbone_buffers = {}
+        target._head_buffers = None
+        if self.cuda_graphs:
+            target._attach_graph_slot()
         target.template_features = None
         target.template_pixels = None
         target._last_update_time = target._last_template_time = None
@@ -72,6 +134,32 @@ class NanoTrackORT:
         for name in ("center_pos", "size", "channel_average"):
             target.__dict__.pop(name, None)
         return target
+
+    def _attach_graph_slot(self):
+        self._graph_slot = self._graph_pool.acquire()
+        self._backbone_buffers = self._graph_slot['backbone']
+        self._head_buffers = self._graph_slot['head']
+        # Neither the slot nor this callback owns the target itself.
+        weakref.finalize(self, self._graph_pool.release, self._graph_slot)
+
+    @staticmethod
+    def _select_feature_device(backbone, head):
+        """Honor active provider precedence and configured device IDs.
+
+        CUDA/TensorRT use public CUDA OrtValues. Other EPs retain ORT-managed
+        host transfers; do not incorrectly label DirectML/OpenVINO memory CUDA.
+        """
+        devices = []
+        for session in (backbone, head):
+            primary = session.get_providers()[0]
+            if primary in ('CUDAExecutionProvider', 'TensorrtExecutionProvider'):
+                options = session.get_provider_options().get(primary, {})
+                devices.append(('cuda', int(options.get('device_id', 0))))
+            else:
+                devices.append(('cpu', 0))
+        if devices[0] != devices[1]:
+            raise ValueError(f"Backbone/head must use the same feature device: {devices}")
+        return devices[0]
 
     @property
     def template_fc_hz(self):
@@ -109,15 +197,73 @@ class NanoTrackORT:
         features = []
         for side, expected in ((127, 8), (255, 16)):
             result = self._features(np.zeros((1, 3, side, side), np.float32))
-            if result.shape != (1, 96, expected, expected) or not np.isfinite(result).all():
-                raise ValueError(f"Invalid runtime backbone output for {side}: {result.shape}")
+            # A one-time startup readback validates actual tensors; updates never
+            # copy backbone features to the host on the device-resident path.
+            observed = result.numpy() if isinstance(result, ort.OrtValue) else result
+            if observed.shape != (1, 96, expected, expected) or not np.isfinite(observed).all():
+                raise ValueError(f"Invalid runtime backbone output for {side}: {observed.shape}")
             features.append(result)
-        cls, loc = self.head.run([self.cls_name, self.loc_name], dict(zip((self.z_name, self.x_name), features)))
+        cls, loc = self._run_head(*features)
         if cls.shape != (1, 2, 15, 15) or loc.shape != (1, 4, 15, 15) or not np.isfinite(cls).all() or not np.isfinite(loc).all() or np.any(loc <= 0):
             raise ValueError("Head runtime outputs do not match V3 logits and positive LTRB distances")
 
     def _features(self, tensor):
-        return self.backbone.run([self.output_name], {self.input_name: tensor})[0]
+        if self.feature_device == 'cpu':
+            return self.backbone.run([self.output_name], {self.input_name: tensor})[0]
+        shape = tuple(tensor.shape)
+        if shape not in ((1,3,127,127), (1,3,255,255)):
+            raise ValueError(f"Unsupported V3 backbone input shape: {shape}")
+        session = self.template_backbone if shape[-1] == self.TEMPLATE_SIZE else self.backbone
+        if shape not in self._backbone_buffers:
+            side = 8 if shape[-1] == 127 else 16
+            device_input = ort.OrtValue.ortvalue_from_shape_and_type(shape, np.float32, self.feature_device, self.device_id)
+            features = ort.OrtValue.ortvalue_from_shape_and_type((1,96,side,side), np.float32, self.feature_device, self.device_id)
+            binding = session.io_binding()
+            binding.bind_ortvalue_input(self.input_name, device_input)
+            binding.bind_ortvalue_output(self.output_name, features)
+            self._backbone_buffers[shape] = (device_input, features, binding)
+        device_input, features, binding = self._backbone_buffers[shape]
+        device_input.update_inplace(tensor)  # One crop upload; stable device allocation.
+        binding.synchronize_inputs()
+        if self.cuda_graphs:
+            session.run_with_iobinding(binding, self._graph_slot['options'])
+        else:
+            session.run_with_iobinding(binding)
+        binding.synchronize_outputs()  # Head may execute on a different session stream.
+        return features
+
+    def _run_head(self, template, search):
+        if self.feature_device == 'cpu':
+            return self.head.run([self.cls_name, self.loc_name],
+                                 {self.z_name: template, self.x_name: search})
+        if self._head_buffers is None:
+            binding = self.head.io_binding()
+            # Only final small logits/distances are needed on CPU for postprocessing.
+            arrays = [np.empty((1,2,15,15), np.float32), np.empty((1,4,15,15), np.float32)]
+            host_values = ([ort.OrtValue.ortvalue_from_shape_and_type(a.shape, np.float32, 'cuda', self.device_id)
+                            for a in arrays] if self.cuda_graphs else
+                           [ort.OrtValue.ortvalue_from_numpy(a) for a in arrays])
+            for name, value in zip((self.cls_name, self.loc_name), host_values):
+                binding.bind_ortvalue_output(name, value)
+            self._head_buffers = binding, arrays, host_values
+            if self.cuda_graphs:
+                self._graph_slot['head'] = self._head_buffers
+        binding, arrays, values = self._head_buffers
+        binding.bind_ortvalue_input(self.z_name, template)
+        binding.bind_ortvalue_input(self.x_name, search)
+        binding.synchronize_inputs()
+        if self.cuda_graphs:
+            expected = (self._backbone_buffers[(1,3,127,127)][1], self._backbone_buffers[(1,3,255,255)][1])
+            if (template.data_ptr(), search.data_ptr()) != tuple(v.data_ptr() for v in expected):
+                raise ValueError('CUDA Graph head inputs must use this target\'s fixed feature buffers')
+            self.head.run_with_iobinding(binding, self._graph_slot['options'])
+        else:
+            self.head.run_with_iobinding(binding)
+        binding.synchronize_outputs()
+        if self.cuda_graphs:
+            for array, value in zip(arrays, values):
+                np.copyto(array, value.numpy())
+        return arrays  # Per-target reusable arrays; consumed before the next update.
 
     @staticmethod
     def _validate_frame(frame):
@@ -156,7 +302,7 @@ class NanoTrackORT:
             raise ValueError("bbox must overlap the image and have valid positive dimensions")
         center = np.array([x + (w-1)/2, y + (h-1)/2])
         size = np.array([w, h])
-        average = frame.mean(axis=(0, 1))
+        average = np.asarray(cv2.mean(frame)[:3])
         side = round(np.sqrt(np.prod(size + self.CONTEXT * size.sum())))
         crop, image = self._crop(frame, center, self.TEMPLATE_SIZE, side, average)
         features = self._features(crop)
@@ -185,7 +331,7 @@ class NanoTrackORT:
         dt = now - self._last_template_time if dt is None else float(dt)
         if not np.isfinite(dt) or dt < 0:
             raise ValueError("dt must be finite and >= 0 seconds")
-        average = frame.mean(axis=(0, 1))
+        average = np.asarray(cv2.mean(frame)[:3])
         side = round(np.sqrt(np.prod(self.size + self.CONTEXT * self.size.sum())))
         crop, image = self._crop(frame, self.center_pos, self.TEMPLATE_SIZE, side, average)
         if self.template_fc_hz > 0:
@@ -227,8 +373,7 @@ class NanoTrackORT:
         if self.debug:
             self.search_image = image
         search = self._features(crop)
-        cls, loc = self.head.run([self.cls_name, self.loc_name],
-                                 {self.z_name: self.template_features, self.x_name: search})
+        cls, loc = self._run_head(self.template_features, search)
         if not np.isfinite(cls).all() or not np.isfinite(loc).all() or np.any(loc <= 0):
             self.last_tracking_ms = (perf_counter() - start) * 1000
             self.confidence = 0.0

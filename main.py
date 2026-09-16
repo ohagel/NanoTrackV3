@@ -11,6 +11,7 @@ import numpy as np
 
 from nanotrack import NanoTrackORT
 from recording import Recorder
+from video_reader import VideoReader
 
 
 class LiveROI:
@@ -68,7 +69,9 @@ def main():
     parser.add_argument("--backbone", default=str(models / "nanotrack_backbone_sim.onnx"))
     parser.add_argument("--head", default=str(models / "nanotrack_head_sim.onnx"))
     parser.add_argument("--providers", nargs="+", default=["CPUExecutionProvider"])
+    parser.add_argument("--cuda-graphs", action="store_true", help="GPU graph replay; requires CUDA first")
     parser.add_argument("--threads", type=int, default=1, help="ORT threads; 0 = runtime default")
+    parser.add_argument("--prefetch", type=int, default=2, help="file decode queue; 0 disables; cameras stay live")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--auto-template", action="store_true", help="replace every target template after each prediction")
     parser.add_argument("--template-fc", type=float, default=2.0, help="template temporal low-pass cutoff in Hz; 0 bypasses (default 2)")
@@ -80,6 +83,8 @@ def main():
     parser.add_argument("--record-dir", default="recordings", help="parent directory for recording sessions")
     parser.add_argument("--record-fps", type=float, help="video playback FPS; defaults to source FPS or 30")
     args = parser.parse_args()
+    if args.prefetch < 0:
+        parser.error('--prefetch must be nonnegative')
     if args.headless and args.bbox is None:
         parser.error("--headless requires --bbox")
     if args.trail_length < 0:
@@ -89,9 +94,9 @@ def main():
     if args.record_fps is not None and (not math.isfinite(args.record_fps) or args.record_fps <= 0):
         parser.error("--record-fps must be finite and > 0")
     engine = NanoTrackORT(args.backbone, args.head, providers=args.providers,
-                           threads=args.threads, debug=args.debug)
+                           threads=args.threads, debug=args.debug, cuda_graphs=args.cuda_graphs)
     source = int(args.source) if args.source.isdecimal() else args.source
-    capture = cv2.VideoCapture(source)
+    capture = VideoReader(source, args.prefetch) if isinstance(source, str) else cv2.VideoCapture(source)
     count, tracked, total_tracking, total_loop = 0, 0, 0.0, 0.0
     window = "NanoTrack V3 | a add | Tab next | r select | t reseed | u auto-template | d remove | v record | q quit"
     selection = LiveROI()

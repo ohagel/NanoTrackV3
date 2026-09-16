@@ -1,0 +1,4 @@
+# Alternative to requirements.txt for NVIDIA CUDA; do not install both ORT packages.
+numpy>=1.26
+opencv-python>=4.8
+onnxruntime-gpu[cuda,cudnn]==1.29.0

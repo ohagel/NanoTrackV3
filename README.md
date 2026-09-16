@@ -5,6 +5,113 @@ NumPy, OpenCV and ONNX Runtime. No `cv2.TrackerNano`, detection, segmentation or
 
 ## Run
 
+### Purdue dataset playback and evaluation
+
+Watch the first clip with automatic annotation-based initialization:
+
+```powershell
+.venv\Scripts\python evaluate_purdue.py --clips 1
+```
+
+Run all clips in numerical order, or choose a subset:
+
+```powershell
+.venv\Scripts\python evaluate_purdue.py --clips all
+.venv\Scripts\python evaluate_purdue.py --clips 3,7,10-12
+.venv\Scripts\python evaluate_purdue.py --clips all --headless
+```
+
+The runner discovers `Clip_N.mov` under `Videos/` and `Clip_N_refined.txt` under
+`Video_Annotation-v2/`, including the nested extraction directories in this project.
+Use `--videos PATH` / `--annotations PATH` for another location. It uses the local
+**refined** MOT-format annotations, not the original raw detections without IDs.
+Frame numbering is 1-based; xywh coordinates are read unchanged, as in the included
+dataset renderer. Positive-confidence interpolated annotation rows are included.
+
+Each target ID is initialized on its first annotated frame overlapping the image.
+Partially off-image boxes keep their geometry and use the tracker's mean padding.
+After initialization, the tracker gets images only: no ground-truth correction,
+redetection, identity reassociation or automatic restart after drift. An ID persists
+through annotation gaps and until the clip ends; a new ID receives its own tracker.
+The two ONNX sessions are shared across all targets and clips, but target state is
+reset between clips. Initialization frames are excluded from accuracy metrics.
+
+Colored boxes/trails are predictions, cyan boxes are reference annotations. A
+3x inset centers on the lowest visible annotation ID to make tiny drones inspectable;
+this uses ground truth **only for visualization**, not for the tracker's search.
+Use `--no-zoom` to hide it. All inference uses original-resolution images; only
+the display is resized to `--display-width 1280` by default.
+
+| Key | Evaluation playback |
+| --- | --- |
+| Space | Pause/resume |
+| `n` | Skip to next clip |
+| `g` | Toggle reference boxes |
+| `q` / close window | Quit evaluation |
+
+Playback is paced to source FPS without dropping frames; it slows down if inference
+cannot keep up. `--fast` removes pacing, and `--headless` always runs unpaced.
+`--max-frames N` limits each clip for smoke tests and marks its summary as limited.
+
+To compare template experiments, use separate runs with identical initializations:
+
+```powershell
+.venv\Scripts\python evaluate_purdue.py --clips 1 --auto-template --template-fc 0
+.venv\Scripts\python evaluate_purdue.py --clips 1 --auto-template --template-fc 2
+```
+
+The default is a fixed template. Cutoff filtering applies only with `--auto-template`;
+its timestep is `1/source_fps`. Evaluation settings are fixed within each run.
+
+Results go into a unique `evaluation_output/` subfolder: `settings.json`, aggregate
+`summary.json` (one entry per clip), and per-clip summaries. Add `--save-tracks` for
+per-frame JSONL with predictions, confidence, initialization flags, reference boxes,
+IoU and center errors. Add `--save-video` to retain annotated AVI playback; full-HD
+MJPEG output can be large. `--output PATH` specifies a new output folder and refuses
+to overwrite an existing one.
+
+Accuracy is measured against the same annotation ID on annotated frames after
+initialization: mean IoU, fraction with IoU >= 0.5, and mean center error in original
+pixels. Frames without that ID's annotation are unscored; this is an initialization-
+assisted tracking test, not detection/MOT evaluation. Refined annotations are the
+provided reference, not independently verified ground truth. Reported tracking FPS
+includes target initialization and updates, excluding decoding/rendering/pacing.
+
+```powershell
+.venv\Scripts\python -m unittest test_purdue.py
+```
+
+### GT-assisted recovery
+
+Purdue also supports **GT-assisted recovery** for watching repeated successes and
+failures without a single early slip spoiling the rest of the clip:
+
+```powershell
+.venv\Scripts\python evaluate_purdue.py --clips 1 --gt-reset
+```
+
+Default: reset an ID after **3 consecutive annotated frames with IoU < 0.1**.
+Tune it with `--reset-iou 0.2 --reset-patience 1`. Optionally add
+`--reset-error-px 20`: either the IoU or center-error threshold can trigger a
+failure. To use center error alone, set `--reset-iou 0 --reset-error-px 20`.
+Unsuccessful tracker updates also count as bad frames. Annotation gaps and fully
+off-image annotations break the consecutive-failure count and cannot trigger resets.
+
+The failed prediction is drawn in red and retains its pre-reset metrics/confidence.
+An on-screen notice identifies the reset frame and ID, and a reset counter stays
+visible. The target then restarts from that frame's GT box for the next frame;
+its template/filter history and trail are reset, with no new ONNX sessions.
+Other targets continue independently. Recovery works with fixed or updating templates.
+
+Summaries label this mode `gt_assisted_recovery` and retain every reset event,
+including the failed box, GT box, IoU, center error, and frames since the previous
+seed. `--save-tracks` additionally logs the reset on its corresponding frame.
+Reset-triggering errors remain in the accuracy averages. These assisted averages
+are not directly comparable to the default unassisted full-sequence baseline.
+Omit `--gt-reset` to keep the original one-initialization-per-ID behavior.
+
+### Interactive camera/video app
+
 From this directory in PowerShell (Python 3.10+):
 
 ```powershell
@@ -246,16 +353,135 @@ maximum raw score. Upstream has no lost-target threshold. `success` defaults to
 true for a finite prediction; optional `confidence_threshold=0.5` flags low
 scores without freezing or changing the original tracking algorithm.
 
-For another provider install its appropriate ONNX Runtime distribution, then:
+For NVIDIA CUDA, replace the CPU-only package in this virtual environment:
+
+```powershell
+.venv\Scripts\python -m pip uninstall -y onnxruntime
+.venv\Scripts\python -m pip install -r requirements-gpu.txt
+```
+
+`requirements-gpu.txt` is an alternative to `requirements.txt`, not an addition.
+Do not install both `onnxruntime` and `onnxruntime-gpu` into the same environment.
+The GPU distribution still supports CPU execution. Its extras install CUDA/cuDNN
+runtime libraries; the tracker calls `preload_dlls()` before CUDA session creation.
+The pinned ORT 1.29 GPU package uses CUDA 13 and cuDNN 9, requiring a compatible
+NVIDIA GPU/driver. See the [official CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html).
+
+Then select CUDA in either app:
 
 ```powershell
 python main.py --providers CUDAExecutionProvider CPUExecutionProvider
+python evaluate_purdue.py --clips 1 --providers CUDAExecutionProvider CPUExecutionProvider
 ```
 
 Use `onnxruntime.get_available_providers()` to see available providers. Unavailable
-requested providers are rejected. The Python API also accepts ORT provider-option
+requested providers are rejected. Both sessions print their active providers;
+if CUDA was requested but failed to load, the tracker refuses silent CPU fallback.
+CPU fallback for individual unsupported operators remains allowed. The Python API also accepts ORT provider-option
 tuples. CPU is the default, with one intra-op thread to avoid thread overhead on
 these small graphs; try `--threads 0` or another count on your machine.
+
+### Faster execution
+
+Enable CUDA Graph replay in either application with `--cuda-graphs`:
+
+```powershell
+.venv\Scripts\python evaluate_purdue.py --clips all --gt-reset --reset-iou 0 --reset-error-px 20 --providers CUDAExecutionProvider CPUExecutionProvider --cuda-graphs --headless
+```
+
+CUDA must be the first provider. The Python equivalent is
+`NanoTrackORT(providers=["CUDAExecutionProvider", "CPUExecutionProvider"], cuda_graphs=True)`.
+Both backbone sizes and the head use captured GPU operations at fixed addresses.
+The head outputs are downloaded for unchanged CPU postprocessing. Capture adds
+startup/first-target overhead; subsequent calls replay the captured operations.
+Slots are recycled after target objects are discarded, including between clips.
+The session pool retains allocations for the peak simultaneous target count until
+the engine and its targets are released. Do not call shared CUDA Graph sessions
+concurrently from different threads. Reseeding and automatic template updates
+reuse the same slots without recapturing or recreating sessions. Omit the flag
+to use ordinary inference; TensorRT and non-CUDA providers do not use this mode.
+
+For CPU, try `--providers CPUExecutionProvider --threads 4`. In a 600-frame clip 50
+test this improved tracking from 63 to 94 FPS with unchanged metrics. One thread
+remains the portable default; benchmark 1, 2 and 4 on the deployment hardware.
+
+Both apps now prefetch **two video-file frames** on a decoder thread by default.
+Use `--prefetch 0` for synchronous decoding. The queue is bounded and never drops
+or reorders frames; recorded source timestamps stay attached to the decoded frame.
+Camera capture remains synchronous to avoid adding a queue of stale live frames.
+Purdue summaries report both tracking-only FPS and loop FPS (including decode,
+evaluation, and any requested rendering, pacing, or recording).
+
+The evaluator's optional `--annotated-only` flag skips updates for IDs missing
+from the current frame's annotations. Their tracker state is preserved and resumes
+on reappearance, with elapsed source time accumulated across the gap. It does not
+automatically reseed on reappearance; the separate GT reset policy still applies.
+This uses ground-truth availability to schedule work, changes the evaluation,
+and is labelled `annotated_only` in summaries and on screen. It is **off by default**;
+omit it for comparisons with earlier runs and for the ordinary tracking lifecycle.
+
+Tests: `python -m unittest discover -v`. The suite checks graph/ordinary inference
+agreement, template updating, reseeding, target isolation, capture-slot recycling,
+lossless prefetch including early shutdown, timestamps, and annotation gaps.
+All 15 tests passed on this host. Sequential runs on clip 50's first 600 frames,
+with GT resets at 20 pixels and automatic template updates off, measured:
+
+| Mode | Tracking FPS | Loop FPS |
+|---|---:|---:|
+| Ordinary CUDA, synchronous decoding | 59.3 | 46.7 |
+| CUDA Graphs, synchronous decoding | 163.3 | 95.2 |
+| CUDA Graphs, prefetch 2 | 160.7 | 151.5 |
+
+Mean IoU, mean centre error and all reset events were exactly equal across these
+three runs. Graphs with continuous template updating at 0.1 Hz on clip 1 measured
+379.5 tracking FPS and 231.9 loop FPS, retaining mean IoU 0.457 and 5 resets.
+The full clip 50 graph run retained mean IoU 0.528 and 52 resets but measured only
+24.1 tracking FPS; the short prefix is not representative of every part of the
+clip. These are local measurements, not Pi benchmarks or guaranteed frame rates.
+
+### Device transfers
+
+The tracker selects its transfer path from the sessions' active provider order:
+
+- **CPU:** NumPy inputs/features throughout, with no GPU allocation or upload.
+- **CUDA:** upload each image crop into a reusable device buffer. Backbone features
+  stay on the GPU and feed the head through ORT I/O bindings. The cached template
+  stays there between frames. Only the final classification and box-distance
+  outputs return to CPU for postprocessing. Bindings synchronize between sessions.
+  Separate persistent backbone sessions handle 127x127 templates and 255x255
+  searches, avoiding expensive GPU setup when switching input sizes. All targets
+  share these sessions; CPU retains a single backbone session.
+- **TensorRT:** uses the same CUDA buffer path (not tested on this host).
+- **Other providers:** use host NumPy interfaces and let ORT manage transfers;
+  device-resident bindings are not implemented for DirectML/OpenVINO/etc.
+
+Cropping and pixel-wise template filtering remain on CPU. Frame-average colours
+use `cv2.mean()` instead of NumPy's slower full-frame reduction. Continuous template
+updating adds one template upload/backbone inference per frame. Reseeding reuses
+sessions and buffers. Each target owns its writable buffers, while sharing the
+sessions; with CUDA Graphs all calls sharing sessions must be serialized. `template_features` is
+an ORT `OrtValue` on CUDA, and a NumPy array on CPU. Calling `.numpy()` on a CUDA
+feature explicitly downloads it; normal tracking never does this. Startup tensor
+validation performs a one-time readback.
+
+Provider options also select the GPU device:
+
+```python
+tracker = NanoTrackORT(providers=[
+    ("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"
+])
+```
+
+Transfer regression checks: `python -m unittest test_device_transfers -v`.
+CUDA tests compare bound inference with ordinary inference on the same GPU,
+check stable buffer addresses, and check independent templates with shared sessions.
+The full 12-test suite passed on this host. After separating GPU backbone sessions
+and optimizing frame averages, Purdue clip 1 with continuous template updates,
+0.1 Hz filtering and GT resets measured **152.0 tracking FPS CUDA** and
+**205.9 tracking FPS CPU** (309 frames, headless), up from 21.0 and 53.9 respectively.
+Mean IoU remained 0.457 on CUDA and 0.468 on CPU, with 5 resets each.
+These tracking rates exclude video decoding/display and are specific to this host.
+Upstream validation also passed with zero bbox error over 300 sample-video frames.
 
 ## Validation and practical limits
 
